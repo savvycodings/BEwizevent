@@ -1,9 +1,17 @@
 import express from 'express'
 import bcrypt from 'bcryptjs'
+import crypto from 'crypto'
 import multer from 'multer'
 import { db } from '../db'
 import { uploadToCloudinary } from '../helpers/uploadToCloudinary'
 import { weekStreakFromAttendance } from '../helpers/weekStreak'
+
+function timingSafeEqual(a: string, b: string): boolean {
+  const bufA = Buffer.from(a)
+  const bufB = Buffer.from(b)
+  if (bufA.length !== bufB.length) return false
+  return crypto.timingSafeEqual(bufA, bufB)
+}
 
 const router = express.Router()
 const upload = multer({ storage: multer.memoryStorage() })
@@ -203,6 +211,21 @@ router.get('/home-summary', async (req, res) => {
     weekStreak,
     feed: feedRows.rows,
   })
+})
+
+router.post('/verify-admin', (req, res) => {
+  const { password } = req.body ?? {}
+  const expected = process.env.ADMIN_PASS
+  if (!expected) {
+    return res.status(500).json({ error: 'ADMIN_PASS is not configured on the server' })
+  }
+  if (typeof password !== 'string' || !password) {
+    return res.status(400).json({ error: 'password is required' })
+  }
+  if (!timingSafeEqual(password, expected)) {
+    return res.status(403).json({ error: 'Incorrect admin password' })
+  }
+  return res.json({ ok: true })
 })
 
 export default router

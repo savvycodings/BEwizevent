@@ -3,8 +3,10 @@ import multer from 'multer'
 import { db } from '../db'
 import { uploadToCloudinary } from '../helpers/uploadToCloudinary'
 import { getPlacementBadgeId, RANK_ORDER, recalculatePlayerRankAndXp } from '../ranking'
+import { requireAdminPass } from '../middleware/requireAdminPass'
 
 const router = express.Router()
+router.use(requireAdminPass)
 const upload = multer({ storage: multer.memoryStorage() })
 const MANUAL_BADGE_IDS = [
   'champion',
@@ -571,8 +573,12 @@ router.get('/events/:eventId/leaderboard', async (req, res) => {
         ) AS "lostToName"
       FROM event_attendance a
       JOIN users u ON u.id = a.user_id
-      WHERE a.event_id = $1 AND a.placement IS NOT NULL
-      ORDER BY a.placement ASC, a.updated_at DESC
+      WHERE a.event_id = $1 AND a.attended = TRUE
+      ORDER BY
+        CASE WHEN a.placement IS NULL OR a.placement < 1 THEN 1 ELSE 0 END,
+        a.placement ASC NULLS LAST,
+        u.name ASC,
+        a.updated_at DESC
     `,
     [eventId]
   )
