@@ -168,6 +168,106 @@ router.get('/users/:userId/details', async (req, res) => {
   })
 })
 
+router.get('/users/:userId/snapshot', async (req, res) => {
+  const userId = Number(req.params.userId)
+  if (!Number.isInteger(userId) || userId < 1) {
+    return res.status(400).json({ error: 'userId must be a positive integer' })
+  }
+
+  await recalculatePlayerRankAndXp(userId)
+
+  const userResult = await db.query(
+    `
+      SELECT
+        id,
+        name,
+        email,
+        profile_image_url AS "profileImageUrl",
+        xp,
+        rank
+      FROM users
+      WHERE id = $1
+      LIMIT 1
+    `,
+    [userId]
+  )
+  const user = userResult.rows[0]
+  if (!user) {
+    return res.status(404).json({ error: 'User not found' })
+  }
+
+  const matchStats = await db.query(
+    `
+      SELECT
+        COALESCE((
+          SELECT COUNT(*)::INTEGER FROM event_matches m
+          WHERE m.player_a_id = $1 OR m.player_b_id = $1
+        ), 0) AS "gamesPlayed",
+        COALESCE((
+          SELECT COUNT(*)::INTEGER FROM event_matches m
+          WHERE (m.player_a_id = $1 AND m.outcome = 'a_wins')
+             OR (m.player_b_id = $1 AND m.outcome = 'b_wins')
+        ), 0) AS wins,
+        COALESCE((
+          SELECT COUNT(*)::INTEGER FROM event_matches m
+          WHERE (m.player_a_id = $1 AND m.outcome = 'b_wins')
+             OR (m.player_b_id = $1 AND m.outcome = 'a_wins')
+        ), 0) AS losses,
+        COALESCE((
+          SELECT COUNT(*)::INTEGER FROM event_matches m
+          WHERE (m.player_a_id = $1 OR m.player_b_id = $1) AND m.outcome = 'draw'
+        ), 0) AS draws
+    `,
+    [userId]
+  )
+
+  const placementStats = await db.query(
+    `
+      SELECT
+        COUNT(*) FILTER (WHERE attended = TRUE AND placement = 1)::INTEGER AS "firstPlace",
+        COUNT(*) FILTER (WHERE attended = TRUE AND placement = 2)::INTEGER AS "secondPlace",
+        COUNT(*) FILTER (WHERE attended = TRUE AND placement = 3)::INTEGER AS "thirdPlace",
+        COUNT(*) FILTER (WHERE attended = TRUE AND placement >= 1 AND placement <= 5)::INTEGER AS "topFiveFinishes",
+        COUNT(*) FILTER (WHERE attended = TRUE)::INTEGER AS "eventsAttended"
+      FROM event_attendance
+      WHERE user_id = $1
+    `,
+    [userId]
+  )
+
+  const m = matchStats.rows[0] ?? { gamesPlayed: 0, wins: 0, losses: 0, draws: 0 }
+  const p = placementStats.rows[0] ?? {
+    firstPlace: 0,
+    secondPlace: 0,
+    thirdPlace: 0,
+    topFiveFinishes: 0,
+    eventsAttended: 0,
+  }
+
+  const gamesPlayed = Number(m.gamesPlayed) || 0
+  const wins = Number(m.wins) || 0
+  const losses = Number(m.losses) || 0
+  const draws = Number(m.draws) || 0
+  const winRatioPercent =
+    gamesPlayed > 0 ? Math.round(((wins + 0.5 * draws) / gamesPlayed) * 100) : 0
+
+  return res.json({
+    user,
+    snapshot: {
+      gamesPlayed,
+      wins,
+      losses,
+      draws,
+      winRatioPercent,
+      firstPlace: Number(p.firstPlace) || 0,
+      secondPlace: Number(p.secondPlace) || 0,
+      thirdPlace: Number(p.thirdPlace) || 0,
+      topFiveFinishes: Number(p.topFiveFinishes) || 0,
+      eventsAttended: Number(p.eventsAttended) || 0,
+    },
+  })
+})
+
 router.post('/users/:userId/badges', async (req, res) => {
   const userId = Number(req.params.userId)
   if (!Number.isInteger(userId) || userId < 1) {

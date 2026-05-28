@@ -6,6 +6,7 @@ const PUBLIC_GET = [
   /^\/events\/?$/,
   /^\/events\/[^/]+\/leaderboard\/?$/,
   /^\/users\/[^/]+\/details\/?$/,
+  /^\/users\/[^/]+\/snapshot\/?$/,
   /^\/rankings\/?$/,
 ]
 
