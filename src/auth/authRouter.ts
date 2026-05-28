@@ -195,6 +195,7 @@ router.get('/home-summary', async (req, res) => {
     `
       SELECT
         a.id,
+        e.id AS "eventId",
         e.title AS "eventTitle",
         a.placement AS "placement",
         a.updated_at AS "markedAt"
@@ -211,6 +212,61 @@ router.get('/home-summary', async (req, res) => {
     weekStreak,
     feed: feedRows.rows,
   })
+})
+
+router.get('/attended-events', async (req, res) => {
+  const userId = Number(req.query.userId)
+  if (!userId || Number.isNaN(userId)) {
+    return res.status(400).json({ error: 'userId query parameter is required' })
+  }
+
+  const userCheck = await db.query('SELECT id FROM users WHERE id = $1', [userId])
+  if (!userCheck.rows[0]) {
+    return res.status(404).json({ error: 'User not found' })
+  }
+
+  const rows = await db.query(
+    `
+      SELECT
+        a.id,
+        e.id AS "eventId",
+        e.title AS "eventTitle",
+        e.event_date AS "eventDate",
+        a.placement AS "placement",
+        a.updated_at AS "markedAt"
+      FROM event_attendance a
+      JOIN events e ON e.id = a.event_id
+      WHERE a.user_id = $1 AND a.attended = TRUE
+      ORDER BY a.updated_at DESC
+    `,
+    [userId]
+  )
+
+  return res.json({ events: rows.rows })
+})
+
+router.get('/players', async (req, res) => {
+  const q = String(req.query.q ?? '').trim()
+  const params: string[] = []
+  let sql = `
+    SELECT
+      id,
+      name,
+      profile_image_url AS "profileImageUrl",
+      xp,
+      rank
+    FROM users
+  `
+  if (q.length >= 2) {
+    params.push(`%${q.toLowerCase()}%`)
+    sql += ` WHERE LOWER(name) LIKE $1`
+  }
+  sql += `
+    ORDER BY xp DESC, name ASC
+    LIMIT ${q.length >= 2 ? 50 : 30}
+  `
+  const rows = await db.query(sql, params)
+  return res.json({ players: rows.rows })
 })
 
 router.post('/verify-admin', (req, res) => {

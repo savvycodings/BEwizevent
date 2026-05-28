@@ -3,6 +3,7 @@ import multer from 'multer'
 import { db } from '../db'
 import { uploadToCloudinary } from '../helpers/uploadToCloudinary'
 import { getPlacementBadgeId, RANK_ORDER, recalculatePlayerRankAndXp } from '../ranking'
+import { setEventPlacementWithShift } from '../placementShift'
 import { requireAdminPass } from '../middleware/requireAdminPass'
 
 const router = express.Router()
@@ -795,37 +796,18 @@ router.post('/attendance-placement', async (req, res) => {
   const place =
     placement === null || placement === undefined ? null : Math.floor(Number(placement))
 
-  if (place !== null) {
-    const clash = await db.query(
-      `
-        SELECT u.name AS "userName"
-        FROM event_attendance a
-        JOIN users u ON u.id = a.user_id
-        WHERE a.event_id = $1 AND a.placement = $2 AND a.user_id <> $3
-        LIMIT 1
-      `,
-      [eventId, place, userId]
+  try {
+    const affectedUserIds = await setEventPlacementWithShift(
+      Number(eventId),
+      Number(userId),
+      place
     )
-    if (clash.rows[0]) {
-      return res.status(409).json({
-        error: `Placement ${place} is already assigned to ${clash.rows[0].userName}`,
-      })
-    }
+    await Promise.all(affectedUserIds.map((id) => recalculatePlayerRankAndXp(id)))
+    return res.json({ ok: true })
+  } catch (err: any) {
+    console.error('attendance-placement failed', err)
+    return res.status(500).json({ error: err?.message || 'Placement update failed' })
   }
-
-  await db.query(
-    `
-      INSERT INTO event_attendance (user_id, event_id, attended, placement)
-      VALUES ($1, $2, TRUE, $3)
-      ON CONFLICT (user_id, event_id)
-      DO UPDATE SET placement = EXCLUDED.placement, attended = TRUE, updated_at = NOW()
-    `,
-    [userId, eventId, place]
-  )
-
-  await recalculatePlayerRankAndXp(Number(userId))
-
-  return res.json({ ok: true })
 })
 
 router.post('/attendance', async (req, res) => {
