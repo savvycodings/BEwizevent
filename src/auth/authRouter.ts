@@ -68,34 +68,54 @@ const router = express.Router()
 const upload = multer({ storage: multer.memoryStorage() })
 
 router.post('/upload-profile', upload.single('file'), async (req, res) => {
-  if (!req.file) {
-    return res.status(400).json({ error: 'file is required' })
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: 'file is required' })
+    }
+    const uploadRes = await uploadToCloudinary(req.file.buffer, 'wizardsevents/profiles')
+    return res.json({ imageUrl: uploadRes.secure_url })
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Profile upload failed'
+    return res.status(500).json({ error: message })
   }
-  const uploadRes = await uploadToCloudinary(req.file.buffer, 'wizardsevents/profiles')
-  return res.json({ imageUrl: uploadRes.secure_url })
 })
 
-router.post('/profile-image', async (req, res) => {
-  const { userId, imageUrl } = req.body ?? {}
-  if (!userId || !imageUrl) {
-    return res.status(400).json({ error: 'userId and imageUrl are required' })
-  }
+router.post('/profile-image', upload.single('file'), async (req, res) => {
+  try {
+    const userId = Number(req.body?.userId)
+    let imageUrl = String(req.body?.imageUrl ?? '').trim()
 
-  const result = await db.query(
-    `
+    if (req.file) {
+      const uploadRes = await uploadToCloudinary(req.file.buffer, 'wizardsevents/profiles')
+      imageUrl = uploadRes.secure_url
+    }
+
+    if (!userId || Number.isNaN(userId)) {
+      return res.status(400).json({ error: 'userId is required' })
+    }
+    if (!imageUrl) {
+      return res.status(400).json({ error: 'file or imageUrl is required' })
+    }
+
+    const result = await db.query(
+      `
       UPDATE users
       SET profile_image_url = $1
       WHERE id = $2
       RETURNING ${USER_PROFILE_RETURNING}
     `,
-    [imageUrl, userId]
-  )
+      [imageUrl, userId]
+    )
 
-  if (!result.rows[0]) {
-    return res.status(404).json({ error: 'User not found' })
+    if (!result.rows[0]) {
+      return res.status(404).json({ error: 'User not found' })
+    }
+
+    return res.json({ user: toPublicUser(result.rows[0]), imageUrl })
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Failed to save profile image'
+    return res.status(500).json({ error: message })
   }
-
-  return res.json({ user: toPublicUser(result.rows[0]) })
 })
 
 router.post('/profile', async (req, res) => {
@@ -166,9 +186,15 @@ router.post('/profile', async (req, res) => {
 })
 
 router.post('/signup', async (req, res) => {
-  const { name, email, password, profileImageUrl, homeStore, deckId } = req.body ?? {}
+  const { name, email, password, profileImageUrl, homeStore, deckId, popId } = req.body ?? {}
   if (!name || !email || !password) {
     return res.status(400).json({ error: 'name, email and password are required' })
+  }
+  const popIdRaw = String(popId ?? '').trim()
+  if (!/^\d{5,10}$/.test(popIdRaw)) {
+    return res.status(400).json({
+      error: 'Player ID is required (5–10 digits, same as Pokémon TCG Live / tournament userid)',
+    })
   }
   const storeRaw = String(homeStore ?? '').trim().toLowerCase()
   if (!isHomeStore(storeRaw)) {
@@ -183,6 +209,10 @@ router.post('/signup', async (req, res) => {
   if (existing.rows.length) {
     return res.status(409).json({ error: 'Email already exists' })
   }
+  const popTaken = await db.query('SELECT id FROM users WHERE pop_id = $1', [popIdRaw])
+  if (popTaken.rows.length) {
+    return res.status(409).json({ error: 'Player ID is already registered' })
+  }
 
   const passwordHash = await bcrypt.hash(password, 10)
   const firstUserResult = await db.query('SELECT COUNT(*)::int AS count FROM users')
@@ -190,8 +220,8 @@ router.post('/signup', async (req, res) => {
 
   const result = await db.query(
     `
-      INSERT INTO users (name, email, password_hash, profile_image_url, is_admin, home_store, active_deck_id)
-      VALUES ($1, $2, $3, $4, $5, $6, $7)
+      INSERT INTO users (name, email, password_hash, profile_image_url, is_admin, home_store, active_deck_id, pop_id)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
       RETURNING
         id,
         name,
@@ -199,9 +229,19 @@ router.post('/signup', async (req, res) => {
         profile_image_url AS "profileImageUrl",
         is_admin AS "isAdmin",
         home_store AS "homeStore",
-        active_deck_id AS "activeDeckId"
+        active_deck_id AS "activeDeckId",
+        pop_id AS "popId"
     `,
-    [name, email.toLowerCase(), passwordHash, profileImageUrl || null, isFirstUser, storeRaw, deckRaw]
+    [
+      name,
+      email.toLowerCase(),
+      passwordHash,
+      profileImageUrl || null,
+      isFirstUser,
+      storeRaw,
+      deckRaw,
+      popIdRaw,
+    ]
   )
 
   return res.status(201).json({ user: result.rows[0] })

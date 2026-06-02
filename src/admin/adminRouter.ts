@@ -27,6 +27,8 @@ import {
   JUDGED_AWARD_TYPES,
   type JudgedAwardType,
 } from '../judgedAwards'
+import { importTdfForEvent } from '../tdfImport'
+import { hintFromFileName } from '../tdfParser'
 import {
   entitlementTierForXp,
   getRankEntitlementsForUser,
@@ -965,6 +967,10 @@ router.post('/events', async (req, res) => {
   if (!title) {
     return res.status(400).json({ error: 'title is required' })
   }
+  const banner = String(bannerImageUrl ?? '').trim()
+  if (!banner) {
+    return res.status(400).json({ error: 'bannerImageUrl is required' })
+  }
   const tierRaw = eventTier == null || eventTier === '' ? 'casual' : String(eventTier)
   if (!isEventTier(tierRaw)) {
     return res.status(400).json({ error: 'eventTier must be casual, challenge, or cup' })
@@ -984,7 +990,7 @@ router.post('/events', async (req, res) => {
         event_tier AS "eventTier",
         created_at AS "createdAt"
     `,
-    [title, eventDate || null, location || null, bannerImageUrl || null, createdBy || null, tier]
+    [title, eventDate || null, location || null, banner, createdBy || null, tier]
   )
 
   return res.status(201).json({ event: result.rows[0] })
@@ -1176,6 +1182,29 @@ router.post('/entitlements/redeem', async (req, res) => {
     const message = err instanceof Error ? err.message : 'Redeem failed'
     const status = message === 'No active claim to redeem for this tier' ? 400 : 500
     return res.status(status).json({ error: message })
+  }
+})
+
+router.post('/events/:eventId/import-tdf', async (req, res) => {
+  const eventId = Number(req.params.eventId)
+  if (!Number.isInteger(eventId) || eventId < 1) {
+    return res.status(400).json({ error: 'eventId must be a positive integer' })
+  }
+  const xml = String(req.body?.xml ?? '')
+  const fileName = String(req.body?.fileName ?? 'import.tdf')
+  if (!xml.trim()) {
+    return res.status(400).json({ error: 'xml body is required' })
+  }
+  if (xml.length > 2_000_000) {
+    return res.status(400).json({ error: 'File too large (max 2MB)' })
+  }
+  try {
+    const hint = hintFromFileName(fileName)
+    const result = await importTdfForEvent(eventId, xml, fileName)
+    return res.json({ ok: true, hint, ...result })
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : 'Import failed'
+    return res.status(400).json({ error: message })
   }
 })
 

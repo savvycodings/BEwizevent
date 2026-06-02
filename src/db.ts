@@ -142,4 +142,19 @@ export async function initDb() {
   await db.query(`
     CREATE INDEX IF NOT EXISTS idx_event_judged_awards_winner ON event_judged_awards(winner_user_id);
   `)
+  await db.query(`
+    ALTER TABLE users
+    ADD COLUMN IF NOT EXISTS pop_id TEXT;
+  `)
+  await db.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_users_pop_id ON users(pop_id) WHERE pop_id IS NOT NULL;
+  `)
+  await db.query(`
+    ALTER TABLE event_matches DROP CONSTRAINT IF EXISTS event_matches_outcome_check;
+  `)
+  await db.query(`
+    ALTER TABLE event_matches
+    ADD CONSTRAINT event_matches_outcome_check
+    CHECK (outcome IN ('a_wins', 'b_wins', 'draw', 'pending'));
+  `)
 }
