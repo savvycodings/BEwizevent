@@ -1,4 +1,6 @@
 import { db } from './db'
+import { applyEventTierMultiplier, normalizeEventTier } from './eventTiers'
+import { getJudgedAwardBonusXp } from './judgedAwards'
 
 export const RANK_ORDER = ['Bronze', 'Silver', 'Gold', 'Platinum', 'Diamond', 'Champion'] as const
 export type RankTier = (typeof RANK_ORDER)[number]
@@ -34,9 +36,13 @@ export const RANK_MIN_XP: Record<RankTier, number> = {
   Champion: 2000,
 }
 
-export function getXpForPlacement(placement: number | null | undefined): number {
+export function getXpForPlacement(
+  placement: number | null | undefined,
+  eventTier?: string | null
+): number {
   if (!placement || placement < 1) return 0
-  return PLACEMENT_XP[placement] ?? DEFAULT_PLACEMENT_XP
+  const base = PLACEMENT_XP[placement] ?? DEFAULT_PLACEMENT_XP
+  return applyEventTierMultiplier(base, normalizeEventTier(eventTier ?? 'casual'))
 }
 
 export function getRankForXp(xp: number): RankTier {
@@ -59,18 +65,38 @@ export function getPlacementBadgeId(
 }
 
 export async function recalculatePlayerRankAndXp(userId: number): Promise<{ xp: number; rank: RankTier }> {
-  const placementsRes = await db.query(
-    `
-      SELECT placement
-      FROM event_attendance
-      WHERE user_id = $1 AND placement IS NOT NULL
-    `,
-    [userId]
-  )
+  const [placementsRes, judgedRes] = await Promise.all([
+    db.query(
+      `
+        SELECT a.placement, e.event_tier AS "eventTier"
+        FROM event_attendance a
+        JOIN events e ON e.id = a.event_id
+        WHERE a.user_id = $1 AND a.placement IS NOT NULL
+      `,
+      [userId]
+    ),
+    db.query(
+      `
+        SELECT e.event_tier AS "eventTier"
+        FROM event_judged_awards j
+        JOIN events e ON e.id = j.event_id
+        WHERE j.winner_user_id = $1
+      `,
+      [userId]
+    ),
+  ])
 
-  const xp = placementsRes.rows.reduce((sum: number, row: { placement: number | null }) => {
-    return sum + getXpForPlacement(row.placement)
-  }, 0)
+  const placementXp = placementsRes.rows.reduce(
+    (sum: number, row: { placement: number | null; eventTier?: string | null }) => {
+      return sum + getXpForPlacement(row.placement, row.eventTier)
+    },
+    0
+  )
+  const judgedXp = judgedRes.rows.reduce(
+    (sum: number, row: { eventTier?: string | null }) => sum + getJudgedAwardBonusXp(row.eventTier),
+    0
+  )
+  const xp = placementXp + judgedXp
 
   const rank = getRankForXp(xp)
 

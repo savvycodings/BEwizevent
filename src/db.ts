@@ -70,6 +70,13 @@ export async function initDb() {
     ADD COLUMN IF NOT EXISTS use_match_tracking BOOLEAN NOT NULL DEFAULT FALSE;
   `)
   await db.query(`
+    ALTER TABLE events
+    ADD COLUMN IF NOT EXISTS event_tier TEXT NOT NULL DEFAULT 'casual';
+  `)
+  await db.query(`
+    UPDATE events SET event_tier = 'casual' WHERE event_tier IS NULL OR event_tier = '';
+  `)
+  await db.query(`
     CREATE TABLE IF NOT EXISTS event_matches (
       id SERIAL PRIMARY KEY,
       event_id INTEGER NOT NULL REFERENCES events(id) ON DELETE CASCADE,
@@ -87,5 +94,52 @@ export async function initDb() {
   `)
   await db.query(`
     CREATE INDEX IF NOT EXISTS idx_event_matches_event_round ON event_matches(event_id, round_number);
+  `)
+  await db.query(`
+    ALTER TABLE users
+    ADD COLUMN IF NOT EXISTS active_deck_id TEXT;
+  `)
+  await db.query(`
+    ALTER TABLE users
+    ADD COLUMN IF NOT EXISTS home_store TEXT;
+  `)
+  await db.query(`
+    ALTER TABLE event_attendance
+    ADD COLUMN IF NOT EXISTS deck_id TEXT;
+  `)
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS rank_entitlement_claims (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      tier TEXT NOT NULL,
+      claim_code TEXT NOT NULL,
+      claimed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      redeemed_at TIMESTAMPTZ,
+      redeemed_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+      UNIQUE (user_id, tier),
+      UNIQUE (claim_code)
+    );
+  `)
+  await db.query(`
+    CREATE INDEX IF NOT EXISTS idx_rank_entitlement_claims_user ON rank_entitlement_claims(user_id);
+  `)
+  await db.query(`
+    CREATE INDEX IF NOT EXISTS idx_rank_entitlement_claims_code ON rank_entitlement_claims(claim_code);
+  `)
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS event_judged_awards (
+      id SERIAL PRIMARY KEY,
+      event_id INTEGER NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+      award_type TEXT NOT NULL CHECK (award_type IN ('best_bling', 'best_rogue')),
+      winner_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      awarded_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE (event_id, award_type)
+    );
+  `)
+  await db.query(`
+    CREATE INDEX IF NOT EXISTS idx_event_judged_awards_event ON event_judged_awards(event_id);
+  `)
+  await db.query(`
+    CREATE INDEX IF NOT EXISTS idx_event_judged_awards_winner ON event_judged_awards(winner_user_id);
   `)
 }

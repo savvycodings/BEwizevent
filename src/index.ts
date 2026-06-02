@@ -25,10 +25,10 @@ app.use('/admin', adminRouter)
 async function start() {
   await initDb()
   const raw = process.env.PORT
-  const port = Number(raw) || 3050
+  const port = Number(raw) || 3060
   if (!raw) {
     console.warn(
-      'PORT env is unset; using 3050. On Railway, the platform should set PORT — if public URL fails, set Networking target port to match what you listen on.'
+      'PORT env is unset; using 3060. On Railway, the platform should set PORT — if public URL fails, set Networking target port to match what you listen on.'
     )
   } else {
     console.log(`PORT from environment: ${raw}`)

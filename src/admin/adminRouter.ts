@@ -4,7 +4,35 @@ import { db } from '../db'
 import { uploadToCloudinary } from '../helpers/uploadToCloudinary'
 import { getPlacementBadgeId, RANK_ORDER, recalculatePlayerRankAndXp } from '../ranking'
 import { setEventPlacementWithShift } from '../placementShift'
+import {
+  ensureAttendanceDeckFromActive,
+  ensureAttendanceDecksFromActive,
+  getAttendanceDeckSnapshot,
+  setAttendanceDeck,
+} from '../deckStats'
+import { deckLabel, isValidDeckId } from '../deckCatalog'
+import {
+  logAttendanceDeckSaved,
+  logAttendanceMarked,
+  logMatchRecorded,
+  logPlacementSaved,
+} from '../deckLog'
 import { requireAdminPass } from '../middleware/requireAdminPass'
+import { isEventTier, normalizeEventTier } from '../eventTiers'
+import {
+  getJudgedAwardBonusXp,
+  isJudgedAwardType,
+  JUDGED_AWARD_CRITERIA,
+  JUDGED_AWARD_LABEL,
+  JUDGED_AWARD_TYPES,
+  type JudgedAwardType,
+} from '../judgedAwards'
+import {
+  entitlementTierForXp,
+  getRankEntitlementsForUser,
+  isEntitlementTier,
+  redeemRankEntitlement,
+} from '../rankEntitlements'
 
 const router = express.Router()
 router.use(requireAdminPass)
@@ -333,6 +361,7 @@ router.get('/events', async (_req, res) => {
         banner_image_url AS "bannerImageUrl",
         scheduled_rounds AS "scheduledRounds",
         use_match_tracking AS "useMatchTracking",
+        event_tier AS "eventTier",
         created_at AS "createdAt"
       FROM events
       ORDER BY created_at DESC
@@ -359,6 +388,7 @@ router.get('/events/:eventId/settings', async (req, res) => {
         banner_image_url AS "bannerImageUrl",
         scheduled_rounds AS "scheduledRounds",
         use_match_tracking AS "useMatchTracking",
+        event_tier AS "eventTier",
         created_at AS "createdAt"
       FROM events
       WHERE id = $1
@@ -423,6 +453,7 @@ router.patch('/events/:eventId', async (req, res) => {
         banner_image_url AS "bannerImageUrl",
         scheduled_rounds AS "scheduledRounds",
         use_match_tracking AS "useMatchTracking",
+        event_tier AS "eventTier",
         created_at AS "createdAt"
     `,
     vals
@@ -541,6 +572,20 @@ router.post('/events/:eventId/matches', async (req, res) => {
     `,
     [eventId, round, row.playerAId, row.playerBId, row.outcome]
   )
+  await ensureAttendanceDecksFromActive(eventId, [focal, opponent])
+  const snap = await getAttendanceDeckSnapshot(focal, eventId)
+  const focalWon = r === 'win'
+  logMatchRecorded({
+    userId: focal,
+    eventId,
+    roundNumber: round,
+    focalUserId: focal,
+    opponentUserId: opponent,
+    result: r,
+    deckId: snap.deckId,
+    deckLabel: snap.deckId ? deckLabel(snap.deckId) : null,
+    focalWon,
+  })
   return res.json({ ok: true })
 })
 
@@ -589,6 +634,7 @@ router.get('/events/:eventId/leaderboard', async (req, res) => {
         banner_image_url AS "bannerImageUrl",
         scheduled_rounds AS "scheduledRounds",
         use_match_tracking AS "useMatchTracking",
+        event_tier AS "eventTier",
         created_at AS "createdAt"
       FROM events
       WHERE id = $1
@@ -610,6 +656,7 @@ router.get('/events/:eventId/leaderboard', async (req, res) => {
         u.email AS "userEmail",
         a.placement,
         a.attended,
+        a.deck_id AS "deckId",
         a.updated_at AS "updatedAt",
         COALESCE((
           SELECT COUNT(*)::INTEGER FROM event_matches m
@@ -671,7 +718,55 @@ router.get('/events/:eventId/leaderboard', async (req, res) => {
             )
           ORDER BY m.round_number DESC, m.updated_at DESC
           LIMIT 1
-        ) AS "lostToName"
+        ) AS "lostToName",
+        (
+          SELECT opp_att.deck_id
+          FROM event_matches m
+          JOIN users u_opp ON u_opp.id = (
+            CASE
+              WHEN m.player_a_id = a.user_id THEN m.player_b_id
+              ELSE m.player_a_id
+            END
+          )
+          LEFT JOIN event_attendance opp_att
+            ON opp_att.event_id = m.event_id AND opp_att.user_id = u_opp.id
+          WHERE m.event_id = a.event_id
+            AND (m.player_a_id = a.user_id OR m.player_b_id = a.user_id)
+            AND (
+              (m.player_a_id = a.user_id AND m.outcome = 'b_wins')
+              OR (m.player_b_id = a.user_id AND m.outcome = 'a_wins')
+            )
+          ORDER BY m.round_number DESC, m.updated_at DESC
+          LIMIT 1
+        ) AS "lostToDeckId",
+        (
+          SELECT COALESCE(
+            json_agg(
+              json_build_object(
+                'userId', u_opp.id,
+                'name', u_opp.name,
+                'deckId', opp_att.deck_id
+              )
+              ORDER BY m.round_number ASC, m.updated_at ASC
+            ),
+            '[]'::json
+          )
+          FROM event_matches m
+          JOIN users u_opp ON u_opp.id = (
+            CASE
+              WHEN m.player_a_id = a.user_id THEN m.player_b_id
+              ELSE m.player_a_id
+            END
+          )
+          LEFT JOIN event_attendance opp_att
+            ON opp_att.event_id = m.event_id AND opp_att.user_id = u_opp.id
+          WHERE m.event_id = a.event_id
+            AND (m.player_a_id = a.user_id OR m.player_b_id = a.user_id)
+            AND (
+              (m.player_a_id = a.user_id AND m.outcome = 'b_wins')
+              OR (m.player_b_id = a.user_id AND m.outcome = 'a_wins')
+            )
+        ) AS "lossesTo"
       FROM event_attendance a
       JOIN users u ON u.id = a.user_id
       WHERE a.event_id = $1 AND a.attended = TRUE
@@ -721,7 +816,9 @@ router.get('/events/:eventId/placement-board', async (req, res) => {
         u.name AS "userName",
         u.email AS "userEmail",
         COALESCE(a.attended, FALSE) AS "attended",
-        a.placement AS "placement"
+        a.placement AS "placement",
+        a.deck_id AS "deckId",
+        u.active_deck_id AS "suggestedDeckId"
       FROM users u
       LEFT JOIN event_attendance a ON a.user_id = u.id AND a.event_id = $1
       ORDER BY
@@ -735,25 +832,159 @@ router.get('/events/:eventId/placement-board', async (req, res) => {
   return res.json({ placements: rows.rows })
 })
 
+router.get('/events/:eventId/judged-awards', async (req, res) => {
+  const eventId = Number(req.params.eventId)
+  if (!Number.isInteger(eventId) || eventId < 1) {
+    return res.status(400).json({ error: 'eventId must be a positive integer' })
+  }
+  const eventRes = await db.query<{ event_tier: string }>(
+    `SELECT event_tier FROM events WHERE id = $1`,
+    [eventId]
+  )
+  if (!eventRes.rows[0]) return res.status(404).json({ error: 'Event not found' })
+
+  const tier = eventRes.rows[0].event_tier
+  const bonusXp = getJudgedAwardBonusXp(tier)
+
+  const rows = await db.query(
+    `
+      SELECT
+        j.award_type AS "awardType",
+        j.winner_user_id AS "userId",
+        u.name AS "userName",
+        j.awarded_at AS "awardedAt"
+      FROM event_judged_awards j
+      JOIN users u ON u.id = j.winner_user_id
+      WHERE j.event_id = $1
+    `,
+    [eventId]
+  )
+
+  const byType = new Map(rows.rows.map((r) => [r.awardType, r]))
+  const awards = JUDGED_AWARD_TYPES.map((awardType) => {
+    const row = byType.get(awardType)
+    return {
+      awardType,
+      label: JUDGED_AWARD_LABEL[awardType],
+      criteria: JUDGED_AWARD_CRITERIA[awardType],
+      userId: row?.userId ?? null,
+      userName: row?.userName ?? null,
+      awardedAt: row?.awardedAt ?? null,
+      bonusXp,
+    }
+  })
+
+  return res.json({ eventTier: tier, bonusXp, awards })
+})
+
+router.post('/events/:eventId/judged-awards', async (req, res) => {
+  const eventId = Number(req.params.eventId)
+  const awardType = String(req.body?.awardType ?? '')
+  const userIdRaw = req.body?.userId
+  if (!Number.isInteger(eventId) || eventId < 1) {
+    return res.status(400).json({ error: 'eventId must be a positive integer' })
+  }
+  if (!isJudgedAwardType(awardType)) {
+    return res.status(400).json({ error: 'awardType must be best_bling or best_rogue' })
+  }
+
+  const eventRes = await db.query<{ event_tier: string }>(
+    `SELECT event_tier FROM events WHERE id = $1`,
+    [eventId]
+  )
+  if (!eventRes.rows[0]) return res.status(404).json({ error: 'Event not found' })
+
+  const previous = await db.query<{ winner_user_id: number }>(
+    `SELECT winner_user_id FROM event_judged_awards WHERE event_id = $1 AND award_type = $2`,
+    [eventId, awardType]
+  )
+  const previousWinnerId = previous.rows[0]?.winner_user_id ?? null
+
+  if (userIdRaw == null || userIdRaw === '') {
+    await db.query(
+      `DELETE FROM event_judged_awards WHERE event_id = $1 AND award_type = $2`,
+      [eventId, awardType]
+    )
+  } else {
+    const userId = Number(userIdRaw)
+    if (!Number.isInteger(userId) || userId < 1) {
+      return res.status(400).json({ error: 'userId must be a positive integer' })
+    }
+    const userCheck = await db.query(`SELECT id FROM users WHERE id = $1`, [userId])
+    if (!userCheck.rows[0]) return res.status(404).json({ error: 'User not found' })
+
+    await db.query(
+      `
+        INSERT INTO event_judged_awards (event_id, award_type, winner_user_id)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (event_id, award_type)
+        DO UPDATE SET winner_user_id = EXCLUDED.winner_user_id, awarded_at = NOW()
+      `,
+      [eventId, awardType, userId]
+    )
+  }
+
+  const toRecalc = new Set<number>()
+  if (previousWinnerId) toRecalc.add(previousWinnerId)
+  if (userIdRaw != null && userIdRaw !== '') toRecalc.add(Number(userIdRaw))
+  for (const uid of toRecalc) {
+    await recalculatePlayerRankAndXp(uid)
+  }
+
+  const rows = await db.query(
+    `
+      SELECT
+        j.award_type AS "awardType",
+        j.winner_user_id AS "userId",
+        u.name AS "userName"
+      FROM event_judged_awards j
+      JOIN users u ON u.id = j.winner_user_id
+      WHERE j.event_id = $1
+    `,
+    [eventId]
+  )
+  const byType = new Map(rows.rows.map((r) => [r.awardType, r]))
+  const bonusXp = getJudgedAwardBonusXp(eventRes.rows[0].event_tier)
+  const awards = JUDGED_AWARD_TYPES.map((t: JudgedAwardType) => {
+    const row = byType.get(t)
+    return {
+      awardType: t,
+      label: JUDGED_AWARD_LABEL[t],
+      criteria: JUDGED_AWARD_CRITERIA[t],
+      userId: row?.userId ?? null,
+      userName: row?.userName ?? null,
+      bonusXp,
+    }
+  })
+
+  return res.json({ ok: true, bonusXp, awards })
+})
+
 router.post('/events', async (req, res) => {
-  const { title, eventDate, location, createdBy, bannerImageUrl } = req.body ?? {}
+  const { title, eventDate, location, createdBy, bannerImageUrl, eventTier } = req.body ?? {}
   if (!title) {
     return res.status(400).json({ error: 'title is required' })
   }
+  const tierRaw = eventTier == null || eventTier === '' ? 'casual' : String(eventTier)
+  if (!isEventTier(tierRaw)) {
+    return res.status(400).json({ error: 'eventTier must be casual, challenge, or cup' })
+  }
+  const tier = normalizeEventTier(tierRaw)
 
   const result = await db.query(
     `
-      INSERT INTO events (title, event_date, location, banner_image_url, created_by)
-      VALUES ($1, $2, $3, $4, $5)
+      INSERT INTO events (title, event_date, location, banner_image_url, created_by, event_tier)
+      VALUES ($1, $2, $3, $4, $5, $6)
       RETURNING
         id,
         title,
         event_date AS "eventDate",
         location,
         banner_image_url AS "bannerImageUrl",
+        event_tier AS "eventTier",
         created_at AS "createdAt"
     `,
-    [title, eventDate || null, location || null, bannerImageUrl || null, createdBy || null]
+    [title, eventDate || null, location || null, bannerImageUrl || null, createdBy || null, tier]
   )
 
   return res.status(201).json({ event: result.rows[0] })
@@ -766,10 +997,12 @@ router.get('/attendance', async (_req, res) => {
         a.id,
         a.attended,
         a.placement,
+        a.deck_id AS "deckId",
         a.updated_at AS "updatedAt",
         u.id AS "userId",
         u.name AS "userName",
         u.email AS "userEmail",
+        u.active_deck_id AS "suggestedDeckId",
         e.id AS "eventId",
         e.title AS "eventTitle"
       FROM event_attendance a
@@ -797,16 +1030,52 @@ router.post('/attendance-placement', async (req, res) => {
     placement === null || placement === undefined ? null : Math.floor(Number(placement))
 
   try {
-    const affectedUserIds = await setEventPlacementWithShift(
-      Number(eventId),
-      Number(userId),
-      place
-    )
+    const eventIdNum = Number(eventId)
+    const userIdNum = Number(userId)
+    const affectedUserIds = await setEventPlacementWithShift(eventIdNum, userIdNum, place)
+    await ensureAttendanceDeckFromActive(userIdNum, eventIdNum)
+    const snap = await getAttendanceDeckSnapshot(userIdNum, eventIdNum)
+    logPlacementSaved({
+      userId: userIdNum,
+      eventId: eventIdNum,
+      placement: snap.placement,
+      deckId: snap.deckId,
+      deckLabel: snap.deckId ? deckLabel(snap.deckId) : null,
+      isEventWin: snap.placement === 1,
+    })
     await Promise.all(affectedUserIds.map((id) => recalculatePlayerRankAndXp(id)))
     return res.json({ ok: true })
   } catch (err: any) {
     console.error('attendance-placement failed', err)
     return res.status(500).json({ error: err?.message || 'Placement update failed' })
+  }
+})
+
+router.post('/attendance-deck', async (req, res) => {
+  const { userId, eventId, deckId } = req.body ?? {}
+  if (!userId || !eventId) {
+    return res.status(400).json({ error: 'userId and eventId are required' })
+  }
+  const deck =
+    deckId === null || deckId === undefined || deckId === ''
+      ? null
+      : String(deckId)
+  if (deck != null && !isValidDeckId(deck)) {
+    return res.status(400).json({ error: 'Invalid deck id' })
+  }
+  try {
+    const userIdNum = Number(userId)
+    const eventIdNum = Number(eventId)
+    await setAttendanceDeck(userIdNum, eventIdNum, deck)
+    logAttendanceDeckSaved({
+      userId: userIdNum,
+      eventId: eventIdNum,
+      deckId: deck,
+      label: deck ? deckLabel(deck) : null,
+    })
+    return res.json({ ok: true })
+  } catch (err: any) {
+    return res.status(500).json({ error: err?.message || 'Deck update failed' })
   }
 })
 
@@ -816,17 +1085,98 @@ router.post('/attendance', async (req, res) => {
     return res.status(400).json({ error: 'userId, eventId and attended(boolean) are required' })
   }
 
+  let deckId: string | null = null
+  if (attended) {
+    const u = await db.query(`SELECT active_deck_id AS "activeDeckId" FROM users WHERE id = $1`, [
+      userId,
+    ])
+    deckId = u.rows[0]?.activeDeckId ?? null
+  }
+
   await db.query(
     `
-      INSERT INTO event_attendance (user_id, event_id, attended)
-      VALUES ($1, $2, $3)
+      INSERT INTO event_attendance (user_id, event_id, attended, deck_id)
+      VALUES ($1, $2, $3, $4)
       ON CONFLICT (user_id, event_id)
-      DO UPDATE SET attended = EXCLUDED.attended, updated_at = NOW()
+      DO UPDATE SET
+        attended = EXCLUDED.attended,
+        deck_id = CASE
+          WHEN EXCLUDED.attended AND event_attendance.deck_id IS NULL THEN EXCLUDED.deck_id
+          ELSE event_attendance.deck_id
+        END,
+        updated_at = NOW()
     `,
-    [userId, eventId, attended]
+    [userId, eventId, attended, deckId]
   )
 
+  const userIdNum = Number(userId)
+  const eventIdNum = Number(eventId)
+  if (attended) {
+    await ensureAttendanceDeckFromActive(userIdNum, eventIdNum)
+  }
+  const snap = attended ? await getAttendanceDeckSnapshot(userIdNum, eventIdNum) : null
+  logAttendanceMarked({
+    userId: userIdNum,
+    eventId: eventIdNum,
+    attended,
+    deckId: snap?.deckId ?? deckId,
+    label: snap?.deckId ? deckLabel(snap.deckId) : deckId ? deckLabel(deckId) : null,
+  })
+
   return res.json({ ok: true })
+})
+
+router.get('/users/:userId/entitlements', async (req, res) => {
+  const userId = Number(req.params.userId)
+  if (!userId || Number.isNaN(userId)) {
+    return res.status(400).json({ error: 'Invalid user id' })
+  }
+  try {
+    const userRes = await db.query<{ id: number; name: string; xp: number }>(
+      `SELECT id, name, COALESCE(xp, 0)::int AS xp FROM users WHERE id = $1`,
+      [userId]
+    )
+    const user = userRes.rows[0]
+    if (!user) return res.status(404).json({ error: 'User not found' })
+    const entitlements = await getRankEntitlementsForUser(userId, user.xp)
+    return res.json({
+      user: { id: user.id, name: user.name, xp: user.xp, currentTier: entitlementTierForXp(user.xp) },
+      entitlements,
+    })
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Failed to load entitlements'
+    return res.status(500).json({ error: message })
+  }
+})
+
+router.post('/entitlements/redeem', async (req, res) => {
+  const userId = Number(req.body?.userId)
+  const tier = String(req.body?.tier ?? '')
+  if (!userId || Number.isNaN(userId)) {
+    return res.status(400).json({ error: 'userId is required' })
+  }
+  if (!isEntitlementTier(tier)) {
+    return res.status(400).json({ error: 'Invalid tier' })
+  }
+  try {
+    await redeemRankEntitlement(userId, tier, null)
+    const userRes = await db.query<{ xp: number; name: string; id: number }>(
+      `SELECT id, name, COALESCE(xp, 0)::int AS xp FROM users WHERE id = $1`,
+      [userId]
+    )
+    const user = userRes.rows[0]
+    if (!user) return res.status(404).json({ error: 'User not found' })
+    const entitlements = await getRankEntitlementsForUser(userId, user.xp)
+    return res.json({
+      ok: true,
+      user: { id: user.id, name: user.name, xp: user.xp, currentTier: entitlementTierForXp(user.xp) },
+      entitlements,
+    })
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Redeem failed'
+    const status = message === 'No active claim to redeem for this tier' ? 400 : 500
+    return res.status(status).json({ error: message })
+  }
 })
 
 export default router
