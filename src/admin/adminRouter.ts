@@ -2,7 +2,7 @@ import express from 'express'
 import multer from 'multer'
 import { db } from '../db'
 import { uploadToCloudinary } from '../helpers/uploadToCloudinary'
-import { getPlacementBadgeId, RANK_ORDER, recalculatePlayerRankAndXp } from '../ranking'
+import { getPlacementBadgeId, RANK_ORDER, recalculatePlayerRankAndXp, recalculateEventParticipants } from '../ranking'
 import { setEventPlacementWithShift } from '../placementShift'
 import {
   ensureAttendanceDeckFromActive,
@@ -30,15 +30,48 @@ import {
 import { importTdfForEvent } from '../tdfImport'
 import { hintFromFileName } from '../tdfParser'
 import {
-  entitlementTierForXp,
   getRankEntitlementsForUser,
   isEntitlementTier,
   redeemRankEntitlement,
 } from '../rankEntitlements'
+import leagueRouter from './leagueRouter'
+import { getActiveSeason } from '../seasons'
+import { getPlayerSeasonSnapshot, getUserSeasonDisplay, listPlayersSeasonDisplay } from '../playerProgression'
 
 const router = express.Router()
 router.use(requireAdminPass)
+router.use(leagueRouter)
 const upload = multer({ storage: multer.memoryStorage() })
+
+async function queryPlacementBoardRows(eventId: number) {
+  const rows = await db.query(
+    `
+      SELECT
+        u.id AS "userId",
+        u.name AS "userName",
+        u.email AS "userEmail",
+        COALESCE(a.attended, FALSE) AS "attended",
+        a.placement AS "placement",
+        a.deck_id AS "deckId",
+        u.active_deck_id AS "suggestedDeckId"
+      FROM users u
+      LEFT JOIN event_attendance a ON a.user_id = u.id AND a.event_id = $1
+      ORDER BY
+        CASE WHEN a.placement IS NULL THEN 1 ELSE 0 END,
+        a.placement ASC NULLS LAST,
+        u.name ASC
+    `,
+    [eventId]
+  )
+  return rows.rows
+}
+
+function scheduleEventRecalc(eventId: number) {
+  void recalculateEventParticipants(eventId).catch((err) => {
+    console.error('[admin] background event XP recalc failed', err)
+  })
+}
+
 const MANUAL_BADGE_IDS = [
   'champion',
   'magician',
@@ -69,31 +102,8 @@ router.get('/users', async (_req, res) => {
 })
 
 router.get('/rankings', async (_req, res) => {
-  const users = await db.query(
-    `
-      SELECT
-        id,
-        name,
-        xp,
-        rank,
-        created_at AS "createdAt"
-      FROM users
-      ORDER BY
-        CASE rank
-          WHEN $1 THEN 1
-          WHEN $2 THEN 2
-          WHEN $3 THEN 3
-          WHEN $4 THEN 4
-          WHEN $5 THEN 5
-          WHEN $6 THEN 6
-          ELSE 0
-        END DESC,
-        xp DESC,
-        created_at ASC
-    `,
-    [...RANK_ORDER]
-  )
-  return res.json({ rankings: users.rows })
+  const rankings = await listPlayersSeasonDisplay({ limit: 500 })
+  return res.json({ rankings })
 })
 
 router.get('/users/:userId/details', async (req, res) => {
@@ -127,6 +137,8 @@ router.get('/users/:userId/details', async (req, res) => {
   if (!user) {
     return res.status(404).json({ error: 'User not found' })
   }
+
+  const display = await getUserSeasonDisplay(userId)
 
   const attendance = await db.query(
     `
@@ -192,7 +204,14 @@ router.get('/users/:userId/details', async (req, res) => {
   )
 
   return res.json({
-    user,
+    user: {
+      ...user,
+      xp: display.xp,
+      rank: display.rank,
+      seasonXp: display.seasonXp,
+      lifetimeXp: display.lifetimeXp,
+      entitlementTier: display.entitlementTier,
+    },
     attendance: attendance.rows,
     badges: [...earnedBadges, ...manualBadges],
     stats: stats.rows[0] ?? { eventsAttended: 0, eventRecords: 0 },
@@ -226,6 +245,8 @@ router.get('/users/:userId/snapshot', async (req, res) => {
   if (!user) {
     return res.status(404).json({ error: 'User not found' })
   }
+
+  const display = await getUserSeasonDisplay(userId)
 
   const matchStats = await db.query(
     `
@@ -283,7 +304,14 @@ router.get('/users/:userId/snapshot', async (req, res) => {
     gamesPlayed > 0 ? Math.round(((wins + 0.5 * draws) / gamesPlayed) * 100) : 0
 
   return res.json({
-    user,
+    user: {
+      ...user,
+      xp: display.xp,
+      rank: display.rank,
+      seasonXp: display.seasonXp,
+      lifetimeXp: display.lifetimeXp,
+      entitlementTier: display.entitlementTier,
+    },
     snapshot: {
       gamesPlayed,
       wins,
@@ -318,6 +346,8 @@ router.post('/users/:userId/badges', async (req, res) => {
     `,
     [userId, badgeId]
   )
+
+  await recalculatePlayerRankAndXp(userId)
 
   return res.json({ ok: true })
 })
@@ -811,27 +841,9 @@ router.get('/events/:eventId/placement-board', async (req, res) => {
     return res.status(404).json({ error: 'Event not found' })
   }
 
-  const rows = await db.query(
-    `
-      SELECT
-        u.id AS "userId",
-        u.name AS "userName",
-        u.email AS "userEmail",
-        COALESCE(a.attended, FALSE) AS "attended",
-        a.placement AS "placement",
-        a.deck_id AS "deckId",
-        u.active_deck_id AS "suggestedDeckId"
-      FROM users u
-      LEFT JOIN event_attendance a ON a.user_id = u.id AND a.event_id = $1
-      ORDER BY
-        CASE WHEN a.placement IS NULL THEN 1 ELSE 0 END,
-        a.placement ASC NULLS LAST,
-        u.name ASC
-    `,
-    [eventId]
-  )
+  const rows = await queryPlacementBoardRows(eventId)
 
-  return res.json({ placements: rows.rows })
+  return res.json({ placements: rows })
 })
 
 router.get('/events/:eventId/judged-awards', async (req, res) => {
@@ -926,12 +938,7 @@ router.post('/events/:eventId/judged-awards', async (req, res) => {
     )
   }
 
-  const toRecalc = new Set<number>()
-  if (previousWinnerId) toRecalc.add(previousWinnerId)
-  if (userIdRaw != null && userIdRaw !== '') toRecalc.add(Number(userIdRaw))
-  for (const uid of toRecalc) {
-    await recalculatePlayerRankAndXp(uid)
-  }
+  await recalculateEventParticipants(eventId)
 
   const rows = await db.query(
     `
@@ -963,7 +970,7 @@ router.post('/events/:eventId/judged-awards', async (req, res) => {
 })
 
 router.post('/events', async (req, res) => {
-  const { title, eventDate, location, createdBy, bannerImageUrl, eventTier } = req.body ?? {}
+  const { title, eventDate, location, createdBy, bannerImageUrl, eventTier, store, entryFee, fieldSize } = req.body ?? {}
   if (!title) {
     return res.status(400).json({ error: 'title is required' })
   }
@@ -976,11 +983,16 @@ router.post('/events', async (req, res) => {
     return res.status(400).json({ error: 'eventTier must be casual, challenge, or cup' })
   }
   const tier = normalizeEventTier(tierRaw)
+  const storeRaw = store != null && store !== '' ? String(store).trim().toLowerCase() : null
+  if (storeRaw && storeRaw !== 'glendower' && storeRaw !== 'rosebank') {
+    return res.status(400).json({ error: 'store must be glendower or rosebank' })
+  }
+  const season = await getActiveSeason()
 
   const result = await db.query(
     `
-      INSERT INTO events (title, event_date, location, banner_image_url, created_by, event_tier)
-      VALUES ($1, $2, $3, $4, $5, $6)
+      INSERT INTO events (title, event_date, location, banner_image_url, created_by, event_tier, season_id, store, entry_fee, field_size)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
       RETURNING
         id,
         title,
@@ -988,9 +1000,24 @@ router.post('/events', async (req, res) => {
         location,
         banner_image_url AS "bannerImageUrl",
         event_tier AS "eventTier",
+        store,
+        entry_fee AS "entryFee",
+        field_size AS "fieldSize",
+        season_id AS "seasonId",
         created_at AS "createdAt"
     `,
-    [title, eventDate || null, location || null, banner, createdBy || null, tier]
+    [
+      title,
+      eventDate || null,
+      location || null,
+      banner,
+      createdBy || null,
+      tier,
+      season?.id ?? null,
+      storeRaw,
+      entryFee != null ? Number(entryFee) : 0,
+      fieldSize != null ? Number(fieldSize) : null,
+    ]
   )
 
   return res.status(201).json({ event: result.rows[0] })
@@ -1049,8 +1076,18 @@ router.post('/attendance-placement', async (req, res) => {
       deckLabel: snap.deckId ? deckLabel(snap.deckId) : null,
       isEventWin: snap.placement === 1,
     })
-    await Promise.all(affectedUserIds.map((id) => recalculatePlayerRankAndXp(id)))
-    return res.json({ ok: true })
+    await db.query(
+      `
+        UPDATE events SET field_size = (
+          SELECT COUNT(*)::int FROM event_attendance
+          WHERE event_id = $1 AND attended = TRUE AND placement IS NOT NULL
+        ) WHERE id = $1
+      `,
+      [eventIdNum]
+    )
+    scheduleEventRecalc(eventIdNum)
+    const placements = await queryPlacementBoardRows(eventIdNum)
+    return res.json({ ok: true, placements })
   } catch (err: any) {
     console.error('attendance-placement failed', err)
     return res.status(500).json({ error: err?.message || 'Placement update failed' })
@@ -1129,7 +1166,14 @@ router.post('/attendance', async (req, res) => {
     label: snap?.deckId ? deckLabel(snap.deckId) : deckId ? deckLabel(deckId) : null,
   })
 
-  return res.json({ ok: true })
+  scheduleEventRecalc(eventIdNum)
+
+  return res.json({
+    ok: true,
+    attended,
+    deckId: snap?.deckId ?? deckId,
+    placement: snap?.placement ?? null,
+  })
 })
 
 router.get('/users/:userId/entitlements', async (req, res) => {
@@ -1138,15 +1182,24 @@ router.get('/users/:userId/entitlements', async (req, res) => {
     return res.status(400).json({ error: 'Invalid user id' })
   }
   try {
-    const userRes = await db.query<{ id: number; name: string; xp: number }>(
-      `SELECT id, name, COALESCE(xp, 0)::int AS xp FROM users WHERE id = $1`,
+    const userRes = await db.query<{ id: number; name: string; xp: number; rank: string }>(
+      `SELECT id, name, COALESCE(xp, 0)::int AS xp, rank FROM users WHERE id = $1`,
       [userId]
     )
     const user = userRes.rows[0]
     if (!user) return res.status(404).json({ error: 'User not found' })
-    const entitlements = await getRankEntitlementsForUser(userId, user.xp)
+    const display = await getUserSeasonDisplay(userId)
+    const entitlements = await getRankEntitlementsForUser(userId)
     return res.json({
-      user: { id: user.id, name: user.name, xp: user.xp, currentTier: entitlementTierForXp(user.xp) },
+      user: {
+        id: user.id,
+        name: user.name,
+        xp: display.xp,
+        seasonXp: display.seasonXp,
+        lifetimeXp: display.lifetimeXp,
+        currentTier: display.entitlementTier,
+        currentRank: display.rank,
+      },
       entitlements,
     })
   } catch (err) {
@@ -1166,16 +1219,25 @@ router.post('/entitlements/redeem', async (req, res) => {
   }
   try {
     await redeemRankEntitlement(userId, tier, null)
-    const userRes = await db.query<{ xp: number; name: string; id: number }>(
-      `SELECT id, name, COALESCE(xp, 0)::int AS xp FROM users WHERE id = $1`,
+    const userRes = await db.query<{ xp: number; name: string; id: number; rank: string }>(
+      `SELECT id, name, COALESCE(xp, 0)::int AS xp, rank FROM users WHERE id = $1`,
       [userId]
     )
     const user = userRes.rows[0]
     if (!user) return res.status(404).json({ error: 'User not found' })
-    const entitlements = await getRankEntitlementsForUser(userId, user.xp)
+    const display = await getUserSeasonDisplay(userId)
+    const entitlements = await getRankEntitlementsForUser(userId)
     return res.json({
       ok: true,
-      user: { id: user.id, name: user.name, xp: user.xp, currentTier: entitlementTierForXp(user.xp) },
+      user: {
+        id: user.id,
+        name: user.name,
+        xp: display.xp,
+        seasonXp: display.seasonXp,
+        lifetimeXp: display.lifetimeXp,
+        currentTier: display.entitlementTier,
+        currentRank: display.rank,
+      },
       entitlements,
     })
   } catch (err) {
@@ -1183,6 +1245,34 @@ router.post('/entitlements/redeem', async (req, res) => {
     const status = message === 'No active claim to redeem for this tier' ? 400 : 500
     return res.status(status).json({ error: message })
   }
+})
+
+router.get('/events/:eventId/check-in', async (req, res) => {
+  const eventId = Number(req.params.eventId)
+  if (!Number.isInteger(eventId) || eventId < 1) {
+    return res.status(400).json({ error: 'eventId must be a positive integer' })
+  }
+  const season = await getActiveSeason()
+  const rows = await db.query(
+    `
+      SELECT
+        u.id AS "userId",
+        u.name AS "userName",
+        a.attended,
+        a.placement,
+        a.deck_id AS "deckId",
+        COALESCE(pss.season_xp, 0)::int AS "seasonXp",
+        COALESCE(pss.current_rank, u.rank, 'Bronze') AS "currentRank",
+        COALESCE(pss.entitlement_tier, 'Bronze') AS "entitlementTier"
+      FROM event_attendance a
+      JOIN users u ON u.id = a.user_id
+      LEFT JOIN player_season_stats pss ON pss.user_id = u.id AND pss.season_id = $2
+      WHERE a.event_id = $1
+      ORDER BY u.name ASC
+    `,
+    [eventId, season?.id ?? null]
+  )
+  return res.json({ eventId, seasonId: season?.id ?? null, players: rows.rows })
 })
 
 router.post('/events/:eventId/import-tdf', async (req, res) => {

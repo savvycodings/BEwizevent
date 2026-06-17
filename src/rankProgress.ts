@@ -1,6 +1,13 @@
 import { db } from './db'
 import { getJudgedAwardBonusXp, JUDGED_AWARD_LABEL, type JudgedAwardType } from './judgedAwards'
-import { getRankForXp, getXpForPlacement, type RankTier } from './ranking'
+import { getXpForPlacement, type RankTier } from './ranking'
+import { MAIN_SEASON_THRESHOLDS } from './leagueDefaults'
+import { getRankForSeasonXp } from './seasons'
+import { getActiveSeason } from './seasons'
+
+function rankAtXp(xp: number, thresholds = MAIN_SEASON_THRESHOLDS): RankTier {
+  return getRankForSeasonXp(xp, thresholds)
+}
 
 export type RankProgressPoint = {
   at: string
@@ -147,7 +154,7 @@ function buildSeriesFromRows(
       at: bounds.start.toISOString(),
       label: 'Start',
       cumulativeXp: cumulative,
-      rank: getRankForXp(cumulative),
+      rank: rankAtXp(cumulative),
       placement: 0,
       xpGained: 0,
     })
@@ -193,7 +200,7 @@ function buildSeriesFromRows(
       at: new Date(ts).toISOString(),
       label,
       cumulativeXp: cumulative,
-      rank: getRankForXp(cumulative),
+      rank: rankAtXp(cumulative),
       placement,
       xpGained,
     })
@@ -257,27 +264,43 @@ export function currentMonthKey(): string {
 export type UserXpSnapshot = {
   userId: number
   name: string
+  /** Active season XP (primary display value). */
   xp: number
   rank: RankTier
+  seasonXp: number
+  lifetimeXp: number
+  entitlementTier: RankTier
 }
 
-/** Lifetime XP from users table — used for player-vs-player bar compare. */
+/** Player snapshot — xp/rank are active-season values for UI. */
 export async function getUserXpSnapshot(userId: number): Promise<UserXpSnapshot> {
+  const season = await getActiveSeason()
   const res = await db.query(
-    `SELECT id, name, COALESCE(xp, 0)::int AS xp, rank FROM users WHERE id = $1`,
-    [userId]
+    `
+      SELECT u.id, u.name, COALESCE(u.xp, 0)::int AS xp, u.rank,
+        pss.season_xp, pss.current_rank, pss.entitlement_tier
+      FROM users u
+      LEFT JOIN player_season_stats pss ON pss.user_id = u.id AND pss.season_id = $2
+      WHERE u.id = $1
+    `,
+    [userId, season?.id ?? null]
   )
   const row = res.rows[0]
   if (!row) {
     throw new Error('User not found')
   }
-  const xp = Math.max(0, Number(row.xp) || 0)
-  const rank = (row.rank as RankTier) || getRankForXp(xp)
+  const lifetimeXp = Math.max(0, Number(row.xp) || 0)
+  const seasonXp = Math.max(0, Number(row.season_xp) || 0)
+  const rank = (row.current_rank as RankTier) || rankAtXp(seasonXp)
+  const entitlementTier = (row.entitlement_tier as RankTier) || rank
   return {
     userId: row.id,
     name: row.name,
-    xp,
+    xp: seasonXp,
     rank,
+    seasonXp,
+    lifetimeXp,
+    entitlementTier,
   }
 }
 

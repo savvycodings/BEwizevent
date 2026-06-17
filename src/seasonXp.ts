@@ -1,7 +1,7 @@
 import { db } from './db'
-import { getJudgedAwardBonusXp } from './judgedAwards'
 import { deckLabel } from './deckCatalog'
-import { getRankForXp, getXpForPlacement, type RankTier } from './ranking'
+import { type RankTier } from './leagueDefaults'
+import { getActiveSeason } from './seasons'
 import { normalizeHomeStore, type HomeStore } from './stores'
 
 export type SeasonXpBreakdown = {
@@ -21,122 +21,72 @@ export type SeasonLeaderboardRow = {
   homeStore: HomeStore | null
   activeDeckId: string | null
   activeDeckLabel: string
+  entitlementTier: RankTier
 }
 
 export type SeasonLeaderboardPayload = {
+  seasonId: number | null
+  seasonName: string | null
   seasonYear: number
   scope: 'combined' | HomeStore
   rows: SeasonLeaderboardRow[]
   challengeLeader: SeasonLeaderboardRow | null
   cupChampion: SeasonLeaderboardRow | null
+  overallChampion: SeasonLeaderboardRow | null
 }
 
 export function currentSeasonYear(): number {
   return new Date().getFullYear()
 }
 
-export function seasonBoundsForYear(year: number): { start: Date; end: Date } {
-  return {
-    start: new Date(year, 0, 1, 0, 0, 0, 0),
-    end: new Date(year, 11, 31, 23, 59, 59, 999),
-  }
-}
-
-function eventInSeason(
-  eventDate: string | Date | null,
-  fallbackAt: string | Date,
-  start: Date,
-  end: Date
-): boolean {
-  let ts: number
-  if (eventDate != null) {
-    const raw = eventDate instanceof Date ? eventDate.toISOString() : String(eventDate)
-    const d = new Date(raw.includes('T') ? raw : `${raw}T12:00:00`)
-    ts = d.getTime()
-  } else {
-    const d = fallbackAt instanceof Date ? fallbackAt : new Date(fallbackAt)
-    ts = d.getTime()
-  }
-  if (Number.isNaN(ts)) return false
-  return ts >= start.getTime() && ts <= end.getTime()
-}
-
-function addXp(
-  map: Map<number, SeasonXpBreakdown>,
-  userId: number,
-  xp: number,
-  eventTier: string | null
-) {
-  const cur = map.get(userId) ?? { seasonXp: 0, challengeXp: 0, cupXp: 0 }
-  cur.seasonXp += xp
-  if (eventTier === 'challenge') cur.challengeXp += xp
-  if (eventTier === 'cup') cur.cupXp += xp
-  map.set(userId, cur)
-}
-
-export async function loadSeasonXpByUser(year?: number): Promise<Map<number, SeasonXpBreakdown>> {
-  const seasonYear = year ?? currentSeasonYear()
-  const { start, end } = seasonBoundsForYear(seasonYear)
+async function loadChallengeCupXp(seasonId: number): Promise<Map<number, SeasonXpBreakdown>> {
   const map = new Map<number, SeasonXpBreakdown>()
-
-  const placements = await db.query<{
+  const res = await db.query<{
     userId: number
-    placement: number
+    xp: number
     eventTier: string | null
-    eventDate: string | Date | null
-    updatedAt: string | Date
   }>(
     `
-      SELECT
-        a.user_id AS "userId",
-        a.placement,
-        e.event_tier AS "eventTier",
-        e.event_date AS "eventDate",
-        a.updated_at AS "updatedAt"
-      FROM event_attendance a
-      JOIN events e ON e.id = a.event_id
-      WHERE a.placement IS NOT NULL
-    `
+      SELECT ex.user_id AS "userId", ex.xp_amount AS xp, e.event_tier AS "eventTier"
+      FROM event_xp_awards ex
+      JOIN events e ON e.id = ex.event_id
+      WHERE ex.season_id = $1
+    `,
+    [seasonId]
   )
-
-  for (const row of placements.rows) {
-    if (!eventInSeason(row.eventDate, row.updatedAt, start, end)) continue
-    const xp = getXpForPlacement(row.placement, row.eventTier)
-    if (xp > 0) addXp(map, row.userId, xp, row.eventTier)
+  for (const row of res.rows) {
+    const cur = map.get(row.userId) ?? { seasonXp: 0, challengeXp: 0, cupXp: 0 }
+    cur.seasonXp += row.xp
+    if (row.eventTier === 'challenge') cur.challengeXp += row.xp
+    if (row.eventTier === 'cup') cur.cupXp += row.xp
+    map.set(row.userId, cur)
   }
-
-  const judged = await db.query<{
-    userId: number
-    eventTier: string | null
-    eventDate: string | Date | null
-    awardedAt: string | Date
-  }>(
-    `
-      SELECT
-        j.winner_user_id AS "userId",
-        e.event_tier AS "eventTier",
-        e.event_date AS "eventDate",
-        j.awarded_at AS "awardedAt"
-      FROM event_judged_awards j
-      JOIN events e ON e.id = j.event_id
-    `
-  )
-
-  for (const row of judged.rows) {
-    if (!eventInSeason(row.eventDate, row.awardedAt, start, end)) continue
-    const xp = getJudgedAwardBonusXp(row.eventTier)
-    if (xp > 0) addXp(map, row.userId, xp, row.eventTier)
-  }
-
   return map
 }
 
 export async function buildSeasonLeaderboard(
   scope: 'combined' | HomeStore,
-  year?: number
+  seasonId?: number
 ): Promise<SeasonLeaderboardPayload> {
-  const seasonYear = year ?? currentSeasonYear()
-  const xpByUser = await loadSeasonXpByUser(seasonYear)
+  const season = seasonId ? await (async () => {
+    const { getSeasonById } = await import('./seasons')
+    return getSeasonById(seasonId)
+  })() : await getActiveSeason()
+
+  if (!season) {
+    return {
+      seasonId: null,
+      seasonName: null,
+      seasonYear: currentSeasonYear(),
+      scope,
+      rows: [],
+      challengeLeader: null,
+      cupChampion: null,
+      overallChampion: null,
+    }
+  }
+
+  const xpByUser = await loadChallengeCupXp(season.id)
 
   const usersRes = await db.query<{
     id: number
@@ -145,30 +95,49 @@ export async function buildSeasonLeaderboard(
     rank: string
     home_store: string | null
     active_deck_id: string | null
+    season_xp: number | null
+    current_rank: string | null
+    entitlement_tier: string | null
   }>(
     `
-      SELECT id, name, COALESCE(xp, 0)::int AS xp, rank, home_store, active_deck_id
-      FROM users
-      ORDER BY name ASC
-    `
+      SELECT
+        u.id,
+        u.name,
+        COALESCE(u.xp, 0)::int AS xp,
+        u.rank,
+        u.home_store,
+        u.active_deck_id,
+        pss.season_xp,
+        pss.current_rank,
+        pss.entitlement_tier
+      FROM users u
+      LEFT JOIN player_season_stats pss ON pss.user_id = u.id AND pss.season_id = $1
+      ORDER BY u.name ASC
+    `,
+    [season.id]
   )
 
   let rows: SeasonLeaderboardRow[] = usersRes.rows
-    .filter((u) => scope === 'combined' || normalizeHomeStore(u.home_store) === scope)
+    .filter((u) => {
+      if (scope === 'combined') return true
+      return normalizeHomeStore(u.home_store) === scope
+    })
     .map((u) => {
       const breakdown = xpByUser.get(u.id) ?? { seasonXp: 0, challengeXp: 0, cupXp: 0 }
-      const lifetimeXp = Math.max(0, Number(u.xp) || 0)
+      const seasonXp = u.season_xp ?? breakdown.seasonXp
+      const currentRank = (u.current_rank as RankTier) || 'Bronze'
       return {
         id: u.id,
         name: u.name,
-        rank: (u.rank as RankTier) || getRankForXp(lifetimeXp),
-        lifetimeXp,
-        seasonXp: breakdown.seasonXp,
+        rank: currentRank,
+        lifetimeXp: Math.max(0, Number(u.xp) || 0),
+        seasonXp,
         challengeXp: breakdown.challengeXp,
         cupXp: breakdown.cupXp,
         homeStore: normalizeHomeStore(u.home_store),
         activeDeckId: u.active_deck_id,
         activeDeckLabel: deckLabel(u.active_deck_id),
+        entitlementTier: (u.entitlement_tier as RankTier) || currentRank,
       }
     })
     .sort((a, b) => b.seasonXp - a.seasonXp || b.lifetimeXp - a.lifetimeXp || a.name.localeCompare(b.name))
@@ -177,28 +146,24 @@ export async function buildSeasonLeaderboard(
     rows = rows.filter((r) => r.seasonXp > 0)
   }
 
-  const pickLeader = (pick: (r: SeasonLeaderboardRow) => number) => {
-    let best: SeasonLeaderboardRow | null = null
-    let bestVal = -1
-    for (const r of rows) {
-      const v = pick(r)
-      if (v > bestVal) {
-        bestVal = v
-        best = r
-      }
-    }
-    return bestVal > 0 ? best : null
-  }
-
   const challengeLeader =
-    scope === 'combined' ? null : pickLeader((r) => r.challengeXp)
-  const cupChampion = scope === 'combined' ? null : pickLeader((r) => r.cupXp)
+    scope === 'combined'
+      ? null
+      : [...rows].sort((a, b) => b.challengeXp - a.challengeXp)[0] ?? null
+  const cupChampion =
+    scope === 'combined'
+      ? null
+      : [...rows].sort((a, b) => b.cupXp - a.cupXp)[0] ?? null
+  const overallChampion = rows[0] ?? null
 
   return {
-    seasonYear,
+    seasonId: season.id,
+    seasonName: season.name,
+    seasonYear: new Date(season.startDate).getFullYear(),
     scope,
     rows,
-    challengeLeader,
-    cupChampion,
+    challengeLeader: challengeLeader && challengeLeader.challengeXp > 0 ? challengeLeader : null,
+    cupChampion: cupChampion && cupChampion.cupXp > 0 ? cupChampion : null,
+    overallChampion: overallChampion && overallChampion.seasonXp > 0 ? overallChampion : null,
   }
 }

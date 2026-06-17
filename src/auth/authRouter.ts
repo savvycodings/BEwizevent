@@ -21,7 +21,7 @@ import {
 } from '../rankProgress'
 import {
   claimRankEntitlement,
-  entitlementTierForXp,
+  getEntitlementContext,
   getRankEntitlementsForUser,
   isEntitlementTier,
 } from '../rankEntitlements'
@@ -39,6 +39,7 @@ import {
   logDeckProfileRequest,
 } from '../deckLog'
 import { buildSeasonLeaderboard } from '../seasonXp'
+import { listPlayersSeasonDisplay } from '../playerProgression'
 import { isHomeStore, normalizeHomeStore, type HomeStore } from '../stores'
 
 const USER_PROFILE_RETURNING = `
@@ -315,6 +316,24 @@ router.get('/leaderboards/store/:storeId', async (req, res) => {
   }
 })
 
+router.get('/league/active-season', async (_req, res) => {
+  try {
+    const { getActiveSeason } = await import('../seasons')
+    const { getAntiFarmingConfig, getVeteranGraceConfig } = await import('../leagueConfig')
+    const { listBadgeDefinitions } = await import('../badgesService')
+    const season = await getActiveSeason()
+    const [antiFarm, veteranGrace, badges] = await Promise.all([
+      getAntiFarmingConfig(),
+      getVeteranGraceConfig(),
+      listBadgeDefinitions(),
+    ])
+    return res.json({ season, antiFarm, veteranGrace, badges })
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Failed to load league info'
+    return res.status(500).json({ error: message })
+  }
+})
+
 router.get('/home-summary', async (req, res) => {
   const userId = Number(req.query.userId)
   if (!userId || Number.isNaN(userId)) {
@@ -359,10 +378,24 @@ router.get('/home-summary', async (req, res) => {
     [userId]
   )
 
+  let seasonSnap = null
+  try {
+    const snap = await getUserXpSnapshot(userId)
+    seasonSnap = {
+      seasonXp: snap.seasonXp,
+      rank: snap.rank,
+      entitlementTier: snap.entitlementTier,
+      lifetimeXp: snap.lifetimeXp,
+    }
+  } catch {
+    seasonSnap = null
+  }
+
   return res.json({
     weekStreak,
     gamesPlayed,
     feed: feedRows.rows,
+    season: seasonSnap,
   })
 })
 
@@ -460,8 +493,13 @@ router.get('/rank-progress', async (req, res) => {
       primary,
       compare,
       compareTotals,
-      lifetime: {
+      season: {
         xp: lifetime.xp,
+        rank: lifetime.rank,
+        name: lifetime.name,
+      },
+      lifetime: {
+        xp: lifetime.lifetimeXp,
         rank: lifetime.rank,
         name: lifetime.name,
       },
@@ -498,10 +536,12 @@ router.get('/rank-entitlements', async (req, res) => {
   }
   try {
     const snap = await getUserXpSnapshot(userId)
-    const entitlements = await getRankEntitlementsForUser(userId, snap.xp)
+    const entitlements = await getRankEntitlementsForUser(userId)
     return res.json({
-      currentXp: snap.xp,
-      currentTier: entitlementTierForXp(snap.xp),
+      currentXp: snap.seasonXp,
+      lifetimeXp: snap.lifetimeXp,
+      currentTier: snap.entitlementTier,
+      currentRank: snap.rank,
       entitlements,
     })
   } catch (err) {
@@ -521,9 +561,8 @@ router.post('/rank-entitlements/claim', async (req, res) => {
     return res.status(400).json({ error: 'Invalid tier' })
   }
   try {
-    const snap = await getUserXpSnapshot(userId)
-    const result = await claimRankEntitlement(userId, tier, snap.xp)
-    const entitlements = await getRankEntitlementsForUser(userId, snap.xp)
+    const result = await claimRankEntitlement(userId, tier)
+    const entitlements = await getRankEntitlementsForUser(userId)
     return res.json({
       claimCode: result.claimCode,
       tier,
@@ -604,26 +643,11 @@ router.patch('/active-deck', async (req, res) => {
 router.get('/players', async (req, res) => {
   const q = String(req.query.q ?? '').trim()
   try {
-    const params: string[] = []
-    let sql = `
-      SELECT
-        id,
-        name,
-        profile_image_url AS "profileImageUrl",
-        xp,
-        rank
-      FROM users
-    `
-    if (q.length >= 2) {
-      params.push(`%${q.toLowerCase()}%`)
-      sql += ` WHERE LOWER(name) LIKE $1`
-    }
-    sql += `
-      ORDER BY xp DESC, name ASC
-      LIMIT ${q.length >= 2 ? 50 : 30}
-    `
-    const rows = await db.query(sql, params)
-    return res.json({ players: rows.rows })
+    const players = await listPlayersSeasonDisplay({
+      query: q.length >= 2 ? q : undefined,
+      limit: q.length >= 2 ? 50 : 30,
+    })
+    return res.json({ players })
   } catch (err) {
     logComparePlayersError(q, err, 500)
     const message = err instanceof Error ? err.message : 'Failed to search players'

@@ -9,7 +9,7 @@
     "db:schema": "pnpm run build && node dist/scripts/applySchema.js",
     "db:migrate": "pnpm run db:schema",
     "ngrok": "ngrok http 3060",
-    "dev": "concurrently \"npx tsc --watch\" \"nodemon --exitcrash dist/index.js\"",
+    "dev": "concurrently \"npx tsc --watch\" \"nodemon dist/index.js\"",
     "ngrokfixed": "ngrok http --domain=f82f850f17ee-443370837071186036.ngrok-free.app 3060",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
