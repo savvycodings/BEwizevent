@@ -194,7 +194,7 @@ router.post('/signup', async (req, res) => {
   const popIdRaw = String(popId ?? '').trim()
   if (!/^\d{5,10}$/.test(popIdRaw)) {
     return res.status(400).json({
-      error: 'Player ID is required (5–10 digits, same as Pokémon TCG Live / tournament userid)',
+      error: 'Play! ID is required (5–10 digits)',
     })
   }
   const storeRaw = String(homeStore ?? '').trim().toLowerCase()
@@ -212,7 +212,7 @@ router.post('/signup', async (req, res) => {
   }
   const popTaken = await db.query('SELECT id FROM users WHERE pop_id = $1', [popIdRaw])
   if (popTaken.rows.length) {
-    return res.status(409).json({ error: 'Player ID is already registered' })
+    return res.status(409).json({ error: 'Play! ID is already registered' })
   }
 
   const passwordHash = await bcrypt.hash(password, 10)
