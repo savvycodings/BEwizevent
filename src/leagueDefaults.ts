@@ -96,6 +96,27 @@ export const DEFAULT_BADGE_DEFINITIONS = [
   { id: 'sweat', title: 'Sweat', description: 'Give full effort in a match.', category: 'legacy', xpReward: 25, sortOrder: 45 },
 ] as const
 
+/** Auto-awarded badges — staff cannot assign these manually at events. */
+export const AUTO_AWARD_BADGE_IDS = [
+  'placed1st',
+  'placed2nd',
+  'placed3rd',
+  'iron_trainer',
+  'grinder_25',
+  'grinder_50',
+  'grinder_100',
+  'marathon',
+  'season_finalist',
+  'champions_cape',
+  'cup_champion',
+] as const
+
+export const MANUAL_BADGE_IDS = DEFAULT_BADGE_DEFINITIONS.filter(
+  (b) => !(AUTO_AWARD_BADGE_IDS as readonly string[]).includes(b.id)
+)
+  .sort((a, b) => a.sortOrder - b.sortOrder || a.id.localeCompare(b.id))
+  .map((b) => b.id)
+
 export function thresholdsForSeasonType(type: SeasonType): Record<RankTier, number> {
   return type === 'off_season' ? { ...OFF_SEASON_THRESHOLDS } : { ...MAIN_SEASON_THRESHOLDS }
 }

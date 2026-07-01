@@ -37,6 +37,7 @@ import {
 import leagueRouter from './leagueRouter'
 import { getActiveSeason } from '../seasons'
 import { getPlayerSeasonSnapshot, getUserSeasonDisplay, listPlayersSeasonDisplay } from '../playerProgression'
+import { MANUAL_BADGE_IDS } from '../leagueDefaults'
 
 const router = express.Router()
 router.use(requireAdminPass)
@@ -71,16 +72,6 @@ function scheduleEventRecalc(eventId: number) {
     console.error('[admin] background event XP recalc failed', err)
   })
 }
-
-const MANUAL_BADGE_IDS = [
-  'champion',
-  'magician',
-  'sweat',
-  'scholar',
-  'quick',
-  'scientist',
-  'flawless',
-] as const
 
 router.get('/users', async (_req, res) => {
   const users = await db.query(
@@ -334,7 +325,7 @@ router.post('/users/:userId/badges', async (req, res) => {
   }
 
   const badgeId = String(req.body?.badgeId || '').trim().toLowerCase()
-  if (!MANUAL_BADGE_IDS.includes(badgeId as (typeof MANUAL_BADGE_IDS)[number])) {
+  if (!(MANUAL_BADGE_IDS as readonly string[]).includes(badgeId)) {
     return res.status(400).json({ error: 'invalid badgeId' })
   }
 
@@ -359,7 +350,7 @@ router.post('/users/:userId/badges/remove', async (req, res) => {
   }
 
   const badgeId = String(req.body?.badgeId || '').trim().toLowerCase()
-  if (!MANUAL_BADGE_IDS.includes(badgeId as (typeof MANUAL_BADGE_IDS)[number])) {
+  if (!(MANUAL_BADGE_IDS as readonly string[]).includes(badgeId)) {
     return res.status(400).json({ error: 'invalid badgeId' })
   }
 
